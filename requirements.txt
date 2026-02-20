@@ -1,0 +1,8 @@
+# UI 界面框架
+PyQt6>=6.5.0
+
+# 大模型 API 调用客户端
+openai>=1.0.0
+
+# Word 文档读写支持
+python-docx>=1.1.0
