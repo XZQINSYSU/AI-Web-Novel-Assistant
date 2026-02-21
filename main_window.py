@@ -8,11 +8,10 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLa
 from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QTextDocument
 from PyQt6.QtPrintSupport import QPrinter
-
 from data_manager import NovelProject
-from ai_worker import AutoPilotWorker,AIWorker
+from ai_worker import AutoPilotWorker,AIWorker,CorrectionWorker
 from ui_components import SettingsDialog, CharacterWidget
-
+from PyQt6.QtWidgets import QToolButton, QMenu, QListWidget, QDockWidget # 新增引用
 
 class MainWindow(QMainWindow):
     def __init__(self, project_path):
@@ -52,14 +51,14 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        # ====== 【新增】返回首页按钮 ======
+        # ====== 返回首页按钮 ======
         btn_home = QPushButton("🏠 返回首页")
         btn_home.setStyleSheet(
             "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #E6A23C;")
         btn_home.clicked.connect(self.return_to_home)
         toolbar.addWidget(btn_home)
 
-        # ====== 【本次新增】一键成书按钮 ======
+        # ====== 一键成书按钮 ======
         btn_export = QPushButton("📚 一键成书")
         btn_export.setStyleSheet(
             "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #67C23A;")
@@ -75,15 +74,38 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        lbl_status = QLabel("  💡 提示：在左侧树状图右键可新建卷/章。写文前请确保已配置 API Key。")
+        lbl_status = QLabel("  💡 提示：在左侧树状图右键可新建卷/章。")
         lbl_status.setStyleSheet("color: #909399; font-size: 13px;")
         toolbar.addWidget(lbl_status)
 
+        # ====== 【修复】找回丢失的自动挂机按钮 ======
         self.btn_auto_pilot = QPushButton("🤖 开启自动挂机")
         self.btn_auto_pilot.setStyleSheet(
             "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #9C27B0;")
         self.btn_auto_pilot.clicked.connect(self.toggle_auto_pilot)
         toolbar.addWidget(self.btn_auto_pilot)
+
+        # ====== 全文一键纠错菜单 ======
+        self.btn_full_correct = QToolButton()
+        self.btn_full_correct.setText("🩺 全文一键纠错")
+        self.btn_full_correct.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_full_correct.setStyleSheet(
+            "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #F56C6C; padding: 5px;")
+
+        self.full_correct_menu = QMenu(self)
+        self.full_correct_menu.addAction("错别字/语病纠错", lambda: self.start_correction("full", "typo"))
+        self.full_correct_menu.addAction("设定/逻辑纠错", lambda: self.start_correction("full", "setting"))
+        self.full_correct_menu.addAction("🌟 全部纠错", lambda: self.start_correction("full", "all"))
+        self.btn_full_correct.setMenu(self.full_correct_menu)
+
+        toolbar.addWidget(self.btn_full_correct)
+
+        # ====== 侧边栏开关 ======
+        self.btn_toggle_log = QPushButton("📋 纠错日志")
+        self.btn_toggle_log.setStyleSheet("background-color: transparent; border: none; color: #909399;")
+        self.btn_toggle_log.setCheckable(True)
+        self.btn_toggle_log.clicked.connect(self.toggle_log_sidebar)
+        toolbar.addWidget(self.btn_toggle_log)
 
     def open_settings(self):
         SettingsDialog(self).exec()
@@ -181,45 +203,81 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(10, 0, 0, 0)
 
+        # 1. 顶部操作按钮行 (放在同一个水平布局里)
+        btn_action_layout = QHBoxLayout()
+
         self.btn_start = QPushButton("🚀 根据设定撰写本章")
         self.btn_start.setEnabled(False)  # 必须选中章节才能写
         self.btn_start.setStyleSheet(
             "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;"
         )
         self.btn_start.clicked.connect(self.start_generation)
+        btn_action_layout.addWidget(self.btn_start)
 
+        # 章节一键纠错按钮
+        self.btn_chap_correct = QToolButton()
+        self.btn_chap_correct.setText("🔧 章节一键纠错")
+        self.btn_chap_correct.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_chap_correct.setStyleSheet(
+            "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 6px;")
+        self.btn_chap_correct.setEnabled(False)  # 初始化时未选章节不可用
+
+        self.chap_correct_menu = QMenu(self)
+        self.chap_correct_menu.addAction("错别字/语病纠错", lambda: self.start_correction("chapter", "typo"))
+        self.chap_correct_menu.addAction("设定/逻辑纠错", lambda: self.start_correction("chapter", "setting"))
+        self.chap_correct_menu.addAction("🌟 全部纠错", lambda: self.start_correction("chapter", "all"))
+        self.btn_chap_correct.setMenu(self.chap_correct_menu)
+        btn_action_layout.addWidget(self.btn_chap_correct)
+
+        # 将按钮行加入右侧主布局
+        right_layout.addLayout(btn_action_layout)
+
+        # 2. 思考过程显示区
         self.btn_toggle_thinking = QPushButton("🔽 收起思考过程")
         self.btn_toggle_thinking.setStyleSheet(
             "background-color: transparent; border: none; color: #909399; text-align: left;")
         self.btn_toggle_thinking.clicked.connect(self.toggle_thinking)
+        right_layout.addWidget(self.btn_toggle_thinking)
 
         self.thinking_output = QTextEdit()
         self.thinking_output.setReadOnly(True)
         self.thinking_output.setStyleSheet(
             "background-color: #F8F9FA; color: #8A8F99; border: 1px solid #E4E7ED; border-radius: 6px;")
         self.thinking_output.setFixedHeight(120)
+        right_layout.addWidget(self.thinking_output)
 
+        # 3. 正文显示区
         right_layout.addWidget(
             QLabel("<span style='font-size:16px; font-weight:bold;'>✍️ 小说正文区 (按 Ctrl+S 实时保存到 docx)</span>"))
-        self.content_output = QTextEdit()
-        # 优化正文阅读体验的排版
-        self.content_output.setStyleSheet("""
-            font-size: 16px; 
-            line-height: 1.8; 
-            padding: 15px; 
-            color: #2C3E50;
-            background-color: #FAFAFA;
-        """)
 
-        right_layout.addWidget(self.btn_start)
-        right_layout.addWidget(self.btn_toggle_thinking)
-        right_layout.addWidget(self.thinking_output)
+        self.content_output = QTextEdit()
+        self.content_output.setStyleSheet("""
+                    font-size: 16px; 
+                    line-height: 1.8; 
+                    padding: 15px; 
+                    color: #2C3E50;
+                    background-color: #FAFAFA;
+                """)
         right_layout.addWidget(self.content_output)
 
+        # ====== 【新增】日志侧边栏 (作为一个可隐藏的 QListWidget) ======
+        self.log_list = QListWidget()
+        self.log_list.setStyleSheet(
+            "background-color: #FAFAFA; border: 1px solid #E4E7ED; color: #606266; padding: 5px;")
+        self.log_list.setWordWrap(True)  # 【新增】开启自动换行，防止日志过长难以查看
+        self.log_list.hide()  # 默认隐藏
+
+        # 将原有的 right_widget 包装进另一个 Splitter，使其能和日志栏左右拖拽
+        right_splitter = QSplitter(Qt.Orientation.Horizontal)
+        right_splitter.addWidget(right_widget)
+        right_splitter.addWidget(self.log_list)
+        right_splitter.setSizes([800, 200])  # 设定初始比例
+
+        # 最后把所有大板块拼装进最外层的 splitter
         splitter.addWidget(tree_container)
         splitter.addWidget(self.stacked_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([250, 350, 800])
+        splitter.addWidget(right_splitter)  # 这里用新的 right_splitter 替换掉了单纯的 right_widget
+        splitter.setSizes([250, 300, 850])
 
         # 初始化加载人物
         for char_data in self.project.meta.get("characters", []):
@@ -247,17 +305,28 @@ class MainWindow(QMainWindow):
         self.thinking_output.setVisible(not is_visible)
         self.btn_toggle_thinking.setText("🔽 收起思考过程" if not is_visible else "▶️ 展开思考过程")
 
-    def update_ui_state(self):
-        # 1. 检查当前视角的章节是否正在被大模型撰写
-        is_viewing_gen_chapter = (self.is_generating and
-                                  self.current_vol_index == self.gen_v_idx and
-                                  self.current_chap_index == self.gen_c_idx)
+    # === 日志侧边栏切换 ===
+    def toggle_log_sidebar(self, checked):
+        if checked:
+            self.log_list.show()
+        else:
+            self.log_list.hide()
 
-        # 如果正在看后台码字的这章，严格锁定文本框，禁止键盘乱按
-        self.content_output.setReadOnly(is_viewing_gen_chapter)
+    def update_ui_state(self):
+        # 1. 检查当前视角的章节是否正在被大模型撰写、纠错或正在自动挂机
+        is_auto_piloting = getattr(self, 'is_auto_piloting', False)
+        is_correcting = getattr(self, 'is_correcting', False)
+        is_generating = getattr(self, 'is_generating', False)
+
+        is_viewing_gen_chapter = ((is_generating or is_auto_piloting) and
+                                  self.current_vol_index == getattr(self, 'gen_v_idx', -1) and
+                                  self.current_chap_index == getattr(self, 'gen_c_idx', -1))
+
+        # 只要正在生成当前章，或者处于全局挂机、全文/单章纠错状态，严格锁定文本框为只读
+        self.content_output.setReadOnly(is_viewing_gen_chapter or is_auto_piloting or is_correcting)
 
         # 2. 动态改变生成按钮的颜色和文案
-        if self.is_generating:
+        if is_generating:
             self.btn_start.setEnabled(True)
             if is_viewing_gen_chapter:
                 self.btn_start.setText("🛑 停止生成 (正在输出当前章)")
@@ -267,6 +336,12 @@ class MainWindow(QMainWindow):
                 self.btn_start.setText("🛑 停止后台生成 (其他章正在码字)")
                 self.btn_start.setStyleSheet(
                     "font-size: 15px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 12px; border-radius: 6px;")
+        elif is_auto_piloting:
+            # 【重要】确保挂机时单章生成按钮依然是禁用状态
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("🤖 挂机模式进行中...")
+            self.btn_start.setStyleSheet(
+                "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;")
         else:
             if self.current_chap_index != -1:
                 self.btn_start.setText("🚀 根据设定撰写本章")
@@ -278,6 +353,130 @@ class MainWindow(QMainWindow):
                 self.btn_start.setEnabled(False)
                 self.btn_start.setStyleSheet(
                     "font-size: 16px; font-weight: bold; background-color: #A0CFFF; color: white; border: none; padding: 12px; border-radius: 6px;")
+
+        # ====== 纠错按钮状态更新 ====== (保留下半部分的这一行，不做修改)
+        has_chap_selected = (self.current_chap_index != -1)
+        is_correcting = getattr(self, 'is_correcting', False)
+
+        if is_correcting:
+            # 纠错进行中：把全文纠错按钮魔改成红色的“停止”按钮
+            self.btn_full_correct.setEnabled(True)
+            self.btn_full_correct.setText("🛑 停止纠错")
+            self.btn_full_correct.setMenu(None)  # 摘掉下拉菜单，变成普通可点击按钮
+            self.btn_full_correct.setStyleSheet(
+                "background-color: #F56C6C; border: 1px solid #DCDFE6; font-weight:bold; color: white; padding: 5px;"
+            )
+            # 绑定停止事件（先静默解绑以防重复绑定）
+            try:
+                self.btn_full_correct.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_full_correct.clicked.connect(self.cancel_correction)
+
+            # 把另一个纠错按钮彻底锁死
+            self.btn_chap_correct.setEnabled(False)
+            self.btn_chap_correct.setText("🔧 纠错运行中...")
+        else:
+            # 恢复正常：把菜单装回去，改回原来的颜色
+            self.btn_full_correct.setEnabled(True)
+            self.btn_full_correct.setText("🩺 全文一键纠错")
+            self.btn_full_correct.setMenu(self.full_correct_menu)
+            self.btn_full_correct.setStyleSheet(
+                "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #F56C6C; padding: 5px;"
+            )
+            # 解除点击事件的绑定，恢复菜单展开默认行为
+            try:
+                self.btn_full_correct.clicked.disconnect()
+            except Exception:
+                pass
+
+            self.btn_chap_correct.setEnabled(has_chap_selected)
+            self.btn_chap_correct.setText("🔧 章节一键纠错")
+            self.btn_chap_correct.setMenu(self.chap_correct_menu)
+            self.btn_chap_correct.setStyleSheet(
+                "font-size: 14px; font-weight: bold; background-color: #E6A23C; color: white; border: none; padding: 10px; border-radius: 6px;"
+            )
+
+    def start_correction(self, scope, mode):
+        api_key = self.settings.value("api_key", "")
+        if not api_key:
+            QMessageBox.warning(self, "错误", "缺少 API Key！")
+            return
+
+        if scope == "chapter" and (self.current_vol_index == -1 or self.current_chap_index == -1):
+            QMessageBox.warning(self, "错误", "请先在左侧选择要纠错的章节！")
+            return
+
+        warning_msg = "全文纠错将扫描全书摘要，可能消耗大量 Token 且耗时较长，请耐心等待。确认开始吗？" if scope == "full" else "即将使用 AI 检查并修改当前章节原文，确认开始吗？"
+        if QMessageBox.question(self, '启动纠错', warning_msg) != QMessageBox.StandardButton.Yes:
+            return
+
+        self.save_all()  # 强制保存当前最新状态
+        self.is_correcting = True
+        self.update_ui_state()
+
+        # 自动展开并清空侧边栏准备记录
+        self.btn_toggle_log.setChecked(True)
+        self.toggle_log_sidebar(True)
+        self.log_list.addItem(f"=== 开始新的纠错任务 ({'全书' if scope == 'full' else '单章'}) ===")
+        self.log_list.scrollToBottom()
+
+        base_url = self.settings.value("base_url", "https://api.deepseek.com")
+        model = self.settings.value("model", "deepseek-reasoner")
+        temp = float(self.settings.value("temperature", 0.7))
+
+        self.correct_worker = CorrectionWorker(api_key, base_url, model, temp, self.project, scope, mode)
+        if scope == "chapter":
+            self.correct_worker.set_target(self.current_vol_index, self.current_chap_index)
+
+        self.correct_worker.status_signal.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.correct_worker.log_signal.connect(self.append_correction_log)
+        self.correct_worker.update_text_signal.connect(self.apply_corrected_text)
+        self.correct_worker.finished_signal.connect(self.correction_finished)
+        self.correct_worker.error_signal.connect(self.handle_error)
+
+        # ====== 【新增】连接思考过程信号，并在启动时清空且展开思考面板 ======
+        self.correct_worker.reasoning_signal.connect(self.append_thinking)
+        self.thinking_output.clear()
+        if not self.thinking_output.isVisible():
+            self.toggle_thinking()
+
+        self.correct_worker.start()
+
+    def append_correction_log(self, log_msg):
+        self.log_list.addItem(log_msg)
+        self.log_list.scrollToBottom()
+
+    def apply_corrected_text(self, v_idx, c_idx, new_content, new_summary):
+        vol_name = self.project.meta["volumes"][v_idx]["name"]
+        chap = self.project.meta["volumes"][v_idx]["chapters"][c_idx]
+        chap_name = chap["name"]
+
+        # 后台落盘
+        self.project.save_chapter_content(vol_name, chap_name, new_content)
+        if new_summary and new_summary != chap.get("ai_synopsis", ""):
+            chap["ai_synopsis"] = new_summary
+            self.project.save_meta()
+
+        # 如果当前 UI 正好停留在被修改的这一章，实时刷新文本框
+        if self.current_vol_index == v_idx and self.current_chap_index == c_idx:
+            self.content_output.setText(new_content)
+            self.statusBar().showMessage(f"✨ 当前章节 [{chap_name}] 纠错并刷新完毕！", 3000)
+
+    def correction_finished(self):
+        self.is_correcting = False
+        self.update_ui_state()  # 这一步会让按钮从“停止”重新变回“一键纠错”
+
+        # 判断是被手动停止的还是自然跑完的
+        if hasattr(self, 'correct_worker') and self.correct_worker._is_cancelled:
+            self.statusBar().showMessage("🛑 纠错任务已手动终止！", 3000)
+            self.log_list.addItem("=== 纠错已手动终止 ===")
+        else:
+            self.statusBar().showMessage("✅ 纠错任务全部完成！", 3000)
+            self.log_list.addItem("=== 纠错任务结束 ===")
+
+        self.log_list.scrollToBottom()
+
     # --- 目录树逻辑 ---
     def refresh_tree(self):
         self.tree.clear()
@@ -412,6 +611,9 @@ class MainWindow(QMainWindow):
         self.refresh_tree()
 
     def on_tree_select(self, item):
+        # 【新增】在切换目录之前，先静默保存当前选中的卷/章信息，防止内容丢失
+        self.save_all(silent=True)
+
         data = item.data(0, Qt.ItemDataRole.UserRole)
         self.current_vol_index = -1
         self.current_chap_index = -1
@@ -440,7 +642,10 @@ class MainWindow(QMainWindow):
             self.chap_synopsis_input.setText(chap_data.get("synopsis", ""))
             self.stacked_widget.setCurrentIndex(2)
 
-            if self.is_generating and self.gen_v_idx == v_idx and self.gen_c_idx == c_idx:
+            # 【关键修复】：增加对挂机状态 is_auto_piloting 的判断，否则挂机时会被当作普通查看，导致思考过程被 clear()
+            is_active_gen = getattr(self, 'is_generating', False) or getattr(self, 'is_auto_piloting', False)
+
+            if is_active_gen and getattr(self, 'gen_v_idx', -1) == v_idx and getattr(self, 'gen_c_idx', -1) == c_idx:
                 # 如果切回了正在生成的章，展示内存中的实时流
                 self.content_output.setText(self.gen_content_buffer)
                 self.thinking_output.setText(self.gen_reasoning_buffer)
@@ -464,7 +669,7 @@ class MainWindow(QMainWindow):
             self.close()  # 关闭当前主窗口
 
     # --- 数据保存逻辑 ---
-    def save_global_meta(self):
+    def save_global_meta(self, silent=False):
         self.project.meta["global_synopsis"] = self.story_synopsis_input.toPlainText().strip()
         chars = []
         for w in self.character_widgets:
@@ -473,38 +678,43 @@ class MainWindow(QMainWindow):
                 chars.append(d)
         self.project.meta["characters"] = chars
         self.project.save_meta()
-        QMessageBox.information(self, "提示", "全局设定保存成功！")
+        if not silent:
+            QMessageBox.information(self, "提示", "全局设定保存成功！")
 
-    def save_vol_meta(self):
+    def save_vol_meta(self, silent=False):
         if self.current_vol_index != -1:
             self.project.meta["volumes"][self.current_vol_index][
                 "synopsis"] = self.vol_synopsis_input.toPlainText().strip()
             self.project.save_meta()
-            QMessageBox.information(self, "提示", "当前卷设定保存成功！")
+            if not silent:
+                QMessageBox.information(self, "提示", "当前卷设定保存成功！")
 
-    def save_chap_meta(self):
+    def save_chap_meta(self, silent=False):
         if self.current_chap_index != -1:
             self.project.meta["volumes"][self.current_vol_index]["chapters"][self.current_chap_index][
                 "synopsis"] = self.chap_synopsis_input.toPlainText().strip()
             self.project.save_meta()
-            QMessageBox.information(self, "提示", "当前章设定保存成功！")
+            if not silent:
+                QMessageBox.information(self, "提示", "当前章设定保存成功！")
 
-    def save_all(self):
+    def save_all(self, silent=True):
         # 1. 如果在全局页，保存全局；如果在卷页，保存卷；如果在章页，保存章梗概和正文
         idx = self.stacked_widget.currentIndex()
         if idx == 0:
-            self.save_global_meta()
+            self.save_global_meta(silent=silent)
         elif idx == 1:
-            self.save_vol_meta()
+            self.save_vol_meta(silent=silent)
         elif idx == 2:
-            self.save_chap_meta()
+            self.save_chap_meta(silent=silent)
             # 保存 docx 正文
             if self.current_vol_index != -1 and self.current_chap_index != -1:
                 vol_name = self.project.meta["volumes"][self.current_vol_index]["name"]
                 chap_name = self.project.meta["volumes"][self.current_vol_index]["chapters"][self.current_chap_index][
                     "name"]
                 self.project.save_chapter_content(vol_name, chap_name, self.content_output.toPlainText())
-            self.statusBar().showMessage("✅ 小说正文及设定已自动保存！", 3000)
+
+        # 无论是快捷键还是切换章节触发，都在底部状态栏提供无感提示
+        self.statusBar().showMessage("✅ 小说正文及设定已自动保存！", 3000)
 
     def export_book(self):
         # 1. 强制保存当前最新进度
@@ -659,7 +869,7 @@ class MainWindow(QMainWindow):
 
                 history_str += f"  - {chap['name']}: {display_syn}\n"
 
-        if len(history_str) > 10000:
+        if len(history_str) > 15000:
             history_str = "【注意：因前文过长，此处仅提供过往卷梗概】\n"
             for i in range(v_idx + 1):
                 vol = meta["volumes"][i]
@@ -688,7 +898,14 @@ class MainWindow(QMainWindow):
 本章细纲要求：{curr_chap.get('synopsis', '无')}
 
 【行动指令】
-请根据本章细纲要求，顺着上一章的情节展开，扩写为文笔流畅的完整正文！记得在结尾使用 `[AI_SUMMARY]` 分割并生成内部总结。"""
+请根据本章细纲要求，顺着上一章的情节展开，扩写为文笔流畅的完整正文！
+【重要】在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约300字高度结构化的【本章复盘与记忆锚点】
+    在 `[AI_SUMMARY]` 之后，必须严格按照以下3个维度输出（客观、精炼，纯作内部记忆使用）：
+    1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件（起因、经过、结果）。
+    2. 人物状态更新：记录本章主角及配角的行为及心态。
+    3. 物品设定更新：记录本章所有物品状态
+
+"""
 
         return system_prompt, user_prompt
 
@@ -745,8 +962,11 @@ class MainWindow(QMainWindow):
             self.thinking_output.ensureCursorVisible()
 
     def append_content(self, text):
+        # [cite_start]【关键修复】：实时将 AI 吐出的文字拼接到后台缓冲区中 [cite: 196]
+        self.gen_content_buffer += text
+
         if "[AI_SUMMARY]" in self.gen_content_buffer:
-            if not self.hit_summary_delimiter:
+            if not getattr(self, 'hit_summary_delimiter', False):
                 self.hit_summary_delimiter = True
                 # 触发分割符时，将正文的最后一部分清理干净渲染到UI上，之后停止更新UI的正文部分
                 if self.current_vol_index == self.gen_v_idx and self.current_chap_index == self.gen_c_idx:
@@ -756,6 +976,12 @@ class MainWindow(QMainWindow):
         else:
             # 正常渲染正文
             if self.current_vol_index == self.gen_v_idx and self.current_chap_index == self.gen_c_idx:
+                # 【核心修复】：先强制将光标移动到文本最末尾，再插入文本。防止鼠标乱点导致文字插错位置！
+                cursor = self.content_output.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self.content_output.setTextCursor(cursor)
+
+                # 在末尾插入最新文本流
                 self.content_output.insertPlainText(text)
                 self.content_output.ensureCursorVisible()
 
@@ -864,8 +1090,8 @@ class MainWindow(QMainWindow):
         self.auto_worker.finished_signal.connect(self.auto_pilot_finished)
         self.auto_worker.error_signal.connect(self.handle_error)
 
-        self.content_output.clear()
-        self.thinking_output.clear()
+        # 【关键修复】：绝对不能在这里 clear() 文本框！
+        # 否则稍后 auto_worker 切换章节时触发的 save_all 会把空文本框覆盖到前一章！
         self.auto_worker.start()
 
     def auto_update_volume(self, v_idx, synopsis):
@@ -932,7 +1158,7 @@ class MainWindow(QMainWindow):
             self.project.meta["volumes"][v_idx]["chapters"][c_idx]["ai_synopsis"] = ai_summary
             self.project.save_meta()
 
-        self.content_output.clear()  # 为下一章清空面板
+        # 【关键修复】：取消这行 clear()，将清理工作交给 on_tree_select 去自然过渡
         self.hit_summary_delimiter = False
 
     def auto_pilot_finished(self):
@@ -942,3 +1168,12 @@ class MainWindow(QMainWindow):
         self.btn_auto_pilot.setStyleSheet(
             "background-color: transparent; border: 1px solid #DCDFE6; font-weight:bold; color: #9C27B0;")
         self.update_ui_state()  # 恢复原有按钮状态
+
+    def cancel_correction(self):
+        """手动暂停/终止纠错任务"""
+        if getattr(self, 'is_correcting', False):
+            if hasattr(self, 'correct_worker') and self.correct_worker.isRunning():
+                self.correct_worker.cancel()  # 触发 Worker 内的取消标记，并强行切断网络流
+                self.log_list.addItem("⚠️ 接收到停止指令，正在等待当前请求安全中断...")
+                self.log_list.scrollToBottom()
+                self.statusBar().showMessage("🛑 正在停止纠错...", 3000)

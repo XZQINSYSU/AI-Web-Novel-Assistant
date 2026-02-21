@@ -153,7 +153,7 @@ class AutoPilotWorker(QThread):
 
         global_synopsis = self.meta.get("global_synopsis", "")
 
-        sys_prompt = "你是一个专业且注重伏笔与逻辑连贯的顶级网文主编。必须返回严格的JSON对象。"
+        sys_prompt = "你是一位网文写手。必须返回严格的JSON对象。"
         user_prompt = f"""
 【全局大纲】
 {global_synopsis}
@@ -164,6 +164,7 @@ class AutoPilotWorker(QThread):
 任务指令：
 1. 遍历【目前已有的卷宗信息】。如果某卷的 synopsis 为空或非常简短，请严格依据【全局大纲】和上下文，为其扩写为详细的剧情走向梗概（绝不能改变原有的卷名！）。如果该卷的 synopsis 已经有具体内容，请原样保留，不要做任何删改。
 2. 判断故事是否完结。如果未完结，请在 new_volumes 中继续规划后续所需的新卷宗（卷名与详细梗概）。
+3. 扩写的内容不可过于俗套
 
 返回格式（严格JSON）：
 {{
@@ -349,7 +350,12 @@ class AutoPilotWorker(QThread):
                 sys_prompt = f"""你是一位经验丰富的网文大神作家。
                     【全局大纲】：{self.meta.get('global_synopsis', '')}
                     【核心人物设定】：\n{char_setting}
-                    【要求】：直接输出正文。在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字的本章详细梗概（包含情节与伏笔）。"""
+                    【要求】：直接输出正文，禁止任何多余的寒暄。在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
+在 `[AI_SUMMARY]` 之后，必须严格按照以下3个维度输出（客观、精炼，纯作内部记忆使用）：
+                    1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件（起因、经过、结果）。
+                    2. 人物状态更新：记录本章主角及配角的行为及心态。
+                    3. 物品设定更新：记录本章所有物品状态
+"""
 
                 # 【修复3】强制优先使用用户手写的 synopsis (如果为空才退回使用 ai_synopsis)
                 user_syn = chap.get("synopsis", "").strip()
@@ -400,3 +406,294 @@ class AutoPilotWorker(QThread):
 
                 # 告诉主线程保存数据
                 self.save_content_signal.emit(v_idx, c_idx, main_content, ai_summary)
+
+class CorrectionWorker(QThread):
+    # 信号定义
+    status_signal = pyqtSignal(str)
+    log_signal = pyqtSignal(str)  # 用于输出到右侧边栏的记录
+    update_text_signal = pyqtSignal(int, int, str, str)  # v_idx, c_idx, new_content, new_summary
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+    reasoning_signal = pyqtSignal(str)
+
+    def __init__(self, api_key, base_url, model, temperature, project, scope, mode):
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.project = project
+        self.meta = project.meta
+        self.scope = scope  # "full" 或 "chapter"
+        self.mode = mode  # "typo", "setting", "all"
+        # 章节级别纠错的坐标
+        self.target_v_idx = -1
+        self.target_c_idx = -1
+        self._is_cancelled = False
+
+    def set_target(self, v_idx, c_idx):
+        self.target_v_idx = v_idx
+        self.target_c_idx = c_idx
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, 'client'):
+            try:
+                self.client.close()
+            except:
+                pass
+
+    def run(self):
+        try:
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+            if self.scope == "chapter":
+                self._correct_single_chapter(self.target_v_idx, self.target_c_idx, self.mode)
+            elif self.scope == "full":
+                self._correct_full_book(self.mode)
+
+            # 无论是否被取消，正常退出时都向主界面发送信号，以恢复 UI 状态
+            self.finished_signal.emit()
+        except Exception as e:
+            # 如果是手动取消引发的网络强行切断异常，直接无视并发送结束信号
+            if self._is_cancelled:
+                self.finished_signal.emit()
+            else:
+                self.error_signal.emit(str(e))
+
+    def _call_llm_json(self, sys_prompt, user_prompt):
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            stream=True  # 【修改处】强行开启流式传输以截获思考过程
+        )
+
+        content_buffer = ""
+        for chunk in resp:
+            if self._is_cancelled: break
+            delta = chunk.choices[0].delta
+
+            # 实时提取并发送思考过程到界面
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                self.reasoning_signal.emit(reasoning)
+
+            # 缓冲后台的 JSON 正文
+            content = getattr(delta, "content", None)
+            if content:
+                content_buffer += content
+
+        if self._is_cancelled:
+            return {}
+
+        # 等待流式传输完毕后，再统一把缓冲区里的字符串解析为 JSON
+        try:
+            return json.loads(content_buffer)
+        except json.JSONDecodeError as e:
+            self.error_signal.emit(f"AI返回的JSON格式有误: {str(e)}")
+            return {}
+
+    def _correct_single_chapter(self, v_idx, c_idx, mode):
+        vol = self.meta["volumes"][v_idx]
+        chap = vol["chapters"][c_idx]
+        content = self.project.read_chapter_content(vol["name"], chap["name"])
+        ai_summary = chap.get("ai_synopsis", "")
+
+        if not content.strip():
+            self.status_signal.emit("⚠️ 当前章节无内容，跳过纠错。")
+            return
+
+        modes_to_run = ["typo", "setting"] if mode == "all" else [mode]
+        current_content = content
+        current_summary = ai_summary
+
+        if "setting" in modes_to_run and not self._is_cancelled:
+            self.status_signal.emit(f"🔍 正在进行【设定纠错】: {chap['name']}...")
+            current_content, current_summary = self._do_setting_correction(v_idx, c_idx, current_content,
+                                                                           current_summary)
+
+        if "typo" in modes_to_run and not self._is_cancelled:
+            self.status_signal.emit(f"📝 正在进行【错别字/语病纠错】: {chap['name']}...")
+            current_content = self._do_typo_correction(v_idx, c_idx, current_content)
+
+        # 统一保存
+        self.update_text_signal.emit(v_idx, c_idx, current_content, current_summary)
+
+    def _correct_full_book(self, mode):
+        if mode in ["setting", "all"]:
+            self.status_signal.emit("🕵️ 开启全书扫描模式，正在统筹全局设定...")
+            # 第一阶段：排查有问题的章节
+            problem_list = self._detect_global_setting_conflicts()
+            if self._is_cancelled: return
+
+            if not problem_list:
+                self.log_signal.emit("✅ 全书设定逻辑严密，未发现吃书或设定矛盾现象！")
+            else:
+                self.log_signal.emit(f"⚠️ 扫描完毕，发现 {len(problem_list)} 个设定矛盾章节，准备逐一修复。")
+                # 第二阶段：遍历修复
+                for issue in problem_list:
+                    if self._is_cancelled: break
+                    v = issue.get("v_idx")
+                    c = issue.get("c_idx")
+                    reason = issue.get("reason")
+                    vol_name = self.meta["volumes"][v]["name"]
+                    chap_name = self.meta["volumes"][v]["chapters"][c]["name"]
+
+                    self.status_signal.emit(f"🔧 正在修复设定矛盾: {vol_name}-{chap_name}...")
+                    self.log_signal.emit(f"[{vol_name}-{chap_name}] 锁定错误: {reason}")
+
+                    old_content = self.project.read_chapter_content(vol_name, chap_name)
+                    old_summary = self.meta["volumes"][v]["chapters"][c].get("ai_synopsis", "")
+                    new_content, new_summary = self._do_setting_correction(v, c, old_content, old_summary,
+                                                                           specific_reason=reason)
+                    self.update_text_signal.emit(v, c, new_content, new_summary)
+
+        if mode in ["typo", "all"]:
+            self.status_signal.emit("📝 开启全书错别字/语病排查...")
+            for v_idx, vol in enumerate(self.meta["volumes"]):
+                for c_idx, chap in enumerate(vol["chapters"]):
+                    if self._is_cancelled: return
+                    self.status_signal.emit(f"📝 正在校对: {vol['name']} - {chap['name']}...")
+                    old_content = self.project.read_chapter_content(vol["name"], chap["name"])
+                    if old_content.strip():
+                        new_content = self._do_typo_correction(v_idx, c_idx, old_content)
+                        summary = chap.get("ai_synopsis", "")
+                        self.update_text_signal.emit(v_idx, c_idx, new_content, summary)
+
+    def _do_typo_correction(self, v_idx, c_idx, content):
+        sys_prompt = "你是一个火眼金睛的专业小说文字校对。你的任务是找出正文中的错别字和语病，并直接修改。必须返回严格的JSON。"
+        user_prompt = f"""
+请校对以下正文。
+要求：
+1. 修正错别字、标点错误、明显不通顺的语病。
+2. 保持原作者的文风和网文特有的爽感表达，不要做不必要的润色和过度修改。
+
+正文内容：
+{content}
+
+返回格式（严格JSON）：
+{{
+    "corrected_text": "完整的修正后的正文（必须完整包含所有段落）",
+    "logs": ["发现[错别字/语病]：原句'...'，修改为'...'"]
+}}
+"""
+        result = self._call_llm_json(sys_prompt, user_prompt)
+        for log in result.get("logs", []):
+            chap_name = self.meta["volumes"][v_idx]["chapters"][c_idx]["name"]
+            self.log_signal.emit(f"✍️ [校对|{chap_name}] {log}")
+        return result.get("corrected_text", content)
+
+    def _do_setting_correction(self, v_idx, c_idx, content, summary, specific_reason=None):
+        # 组装全局和局部大纲作为标准
+        global_synopsis = self.meta.get("global_synopsis", "")
+        vol = self.meta["volumes"][v_idx]
+        chap = vol["chapters"][c_idx]
+
+        # 【升级点1】：获取过往所有章节的剧情概要
+        past_summaries = self._get_past_summaries(v_idx, c_idx)
+
+        sys_prompt = "你是一个资深的网文主编，精通逻辑自洽和设定圆融。必须返回严格的JSON格式。"
+
+        # 拼接豪华版上下文
+        user_prompt = f"【全书总体设定与梗概】：\n{global_synopsis}\n\n"
+        if past_summaries.strip():
+            user_prompt += f"【过往剧情轨迹(防吃书基准)】：\n{past_summaries}\n\n"
+        user_prompt += f"【本卷核心设定】：\n{vol.get('synopsis', '无')}\n\n"
+
+        if specific_reason:
+            # 【升级点2】：全局纠错传入了具体理由，要求结合前文详细扫描并修复
+            user_prompt += f"【目标任务】：这是全局扫描发现的本章逻辑/设定错误。请结合上述【全书设定】和【过往剧情轨迹】，在下方正文中详细扫描并彻底修复该问题：\n{specific_reason}\n\n"
+        else:
+            # 单章纠错模式：让 AI 自己找茬并给出详细理由
+            user_prompt += "【目标任务】：请仔细比对【过往剧情轨迹】和【全书设定】，检查下方正文中是否存在人物崩塌、前言不搭后语、逻辑矛盾（吃书现象，例如：死人复活未说明原因、物品归属错乱等）。请先给出详细的错误诊断理由，然后在正文中直接修复它们。\n\n"
+
+        user_prompt += f"【当前章节正文】：\n{content}\n\n"
+        user_prompt += f"【当前章原AI概要】：\n{summary}\n\n"
+
+        # 【升级点3】：强制要求输出 error_reason 字段
+        user_prompt += """
+返回格式（严格JSON）：
+{
+    "has_issue": true/false, // 如果没有发现任何逻辑设定错误，返回false
+    "error_reason": "详细的错误诊断理由。如果has_issue为true，必须说明正文具体哪里吃书或矛盾了，与前文哪一章冲突。如果为false则填无。",
+    "corrected_text": "修复后的完整正文（如果无错误，原样返回）",
+    "new_ai_summary": "如果正文剧情被修改，请同步更新AI概要（约500字，客观纪实结构化记录核心事件和伏笔）。如果无修改则原样返回。",
+    "logs": ["发现[逻辑设定问题]：...，因此修改了..."] // 记录简要的纠错动作
+}
+"""
+        result = self._call_llm_json(sys_prompt, user_prompt)
+
+        if result.get("has_issue", False):
+            # 将详细的诊断理由打印到 UI 的日志侧边栏中
+            reason = result.get("error_reason", "")
+            if reason and reason != "无":
+                self.log_signal.emit(f"🕵️ [诊断报告|{chap['name']}] {reason}")
+
+            for log in result.get("logs", []):
+                self.log_signal.emit(f"🛠️ [设定修复|{chap['name']}] {log}")
+            return result.get("corrected_text", content), result.get("new_ai_summary", summary)
+
+        return content, summary
+
+    def _detect_global_setting_conflicts(self):
+        # 拼接全书梗概和卷章用户设纲
+        sys_context = f"【全书全局大纲】\n{self.meta.get('global_synopsis', '')}\n\n"
+        char_texts = [f"【{c['name']}】 性别:{c['gender']} 性格:{c['personality']} 经历:{c['experience']}" for c in
+                      self.meta.get("characters", [])]
+        sys_context += f"【核心人物设定】\n{chr(10).join(char_texts)}\n\n"
+
+        # 拼接AI总结的所有章节概要
+        all_summaries = ""
+        for v_idx, vol in enumerate(self.meta["volumes"]):
+            all_summaries += f"\n▶ 第{v_idx + 1}卷: {vol['name']}\n"
+            for c_idx, chap in enumerate(vol["chapters"]):
+                all_summaries += f"  - 第{c_idx + 1}章 [{chap['name']}]: {chap.get('ai_synopsis', '暂无概要')}\n"
+
+        sys_prompt = f"你是一个网文剧情质检专家。这是本书的核心设定基石，请牢记：\n{sys_context}"
+        user_prompt = f"""以下是AI总结的本书目前所有章节的剧情概要。
+请排查是否存在：
+1. 明显偏离【全局大纲】和【核心人物设定】的剧情。
+2. 内部逻辑矛盾（吃书现象，例如：死人复活未说明原因、物品归属错乱、人物性格变化极大、人名串台）。
+
+概要记录：
+{all_summaries}
+
+任务：定位存在严重矛盾和吃书现象的章节，并详细说明错因。
+返回格式（严格JSON）：
+{{
+    "problematic_chapters": [
+        {{
+            "v_idx": 卷索引(整数，从0开始),
+            "c_idx": 章索引(整数，从0开始),
+            "reason": "详细说明错在哪里，与哪一部分设定或前面哪一章产生了矛盾"
+        }}
+    ]
+}}
+如果完全没有矛盾，"problematic_chapters"返回空数组。
+"""
+        result = self._call_llm_json(sys_prompt, user_prompt)
+        return result.get("problematic_chapters", [])
+
+    def _get_past_summaries(self, target_v_idx, target_c_idx):
+        """获取目标章节之前的所有剧情概要（作为防吃书的记忆基准）"""
+        history_str = ""
+        for v_idx in range(target_v_idx + 1):
+            vol = self.meta["volumes"][v_idx]
+            history_str += f"\n▶ 第{v_idx + 1}卷: {vol['name']} (本卷梗概: {vol.get('synopsis', '无')})\n"
+
+            # 限制章节遍历范围：如果是目标章节所在卷，只遍历到目标章节之前；如果是之前的卷，遍历整卷
+            chap_limit = target_c_idx if v_idx == target_v_idx else len(vol["chapters"])
+            for c_idx in range(chap_limit):
+                chap = vol["chapters"][c_idx]
+                # 优先读取 AI 之前生成的详细梗概，没有则读用户的
+                ai_syn = chap.get("ai_synopsis", "")
+                user_syn = chap.get("synopsis", "")
+                display_syn = ai_syn if ai_syn.strip() else (user_syn if user_syn.strip() else "暂无概要")
+
+                history_str += f"  - 第{c_idx + 1}章 [{chap['name']}]: {display_syn}\n"
+        return history_str

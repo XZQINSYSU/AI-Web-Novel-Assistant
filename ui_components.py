@@ -103,7 +103,7 @@ class SettingsDialog(QDialog):
         self.temp_input.setValue(float(self.settings.value("temperature", 0.7)))
 
         self.tokens_input = QSpinBox()
-        self.tokens_input.setRange(500, 32000)
+        self.tokens_input.setRange(500, 128000)
         self.tokens_input.setSingleStep(500)
         self.tokens_input.setValue(int(self.settings.value("max_tokens", 4000)))
 
