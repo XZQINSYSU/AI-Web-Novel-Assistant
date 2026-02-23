@@ -73,14 +73,17 @@ class AutoPilotWorker(QThread):
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
 
-    def __init__(self, api_key, base_url, model, temperature, project_meta):
+    # 修改 __init__，加入 mode 和 target_v_idx 参数
+    def __init__(self, api_key, base_url, model, temperature, project_meta, mode="full", target_v_idx=-1):
         super().__init__()
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
-        self.project = project_meta  # 【修改处】保存整个 project 对象
-        self.meta = project_meta.meta  # 传入当前项目的快照
+        self.project = project_meta
+        self.meta = project_meta.meta
+        self.mode = mode  # "full" 或 "volume"
+        self.target_v_idx = target_v_idx  # 指定的一键卷索引
         self._is_cancelled = False
 
     def cancel(self):
@@ -92,30 +95,94 @@ class AutoPilotWorker(QThread):
             except Exception:
                 pass
 
+    # 修改 run 方法，加入前置判断跳过逻辑
     def run(self):
         try:
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-            # 阶段 1：规划后续所有卷宗
-            self.status_signal.emit("🔄 阶段 1/3: 正在统筹全局，规划后续卷宗...")
-            self._plan_volumes()
-            if self._is_cancelled: return
+            if self.mode == "full":
+                # 阶段 1：规划后续所有卷宗
+                self.status_signal.emit("🔄 阶段 1/3: 正在统筹全局，规划后续卷宗...")
+                self._plan_volumes()
+                if self._is_cancelled: return
 
-            # 阶段 2：遍历卷宗，规划每一卷的详细章节
-            self.status_signal.emit("🔄 阶段 2/3: 正在为每一卷规划章节细纲...")
-            self._plan_chapters()
-            if self._is_cancelled: return
+                # 阶段 2：遍历卷宗，规划每一卷的详细章节
+                self.status_signal.emit("🔄 阶段 2/3: 正在为每一卷规划章节细纲...")
+                self._plan_chapters()
+                if self._is_cancelled: return
 
-            # 阶段 3：逐章生成正文
-            self.status_signal.emit("🔄 阶段 3/3: 开启全自动挂机码字模式！")
+            elif self.mode == "volume":
+                # 【补丁更新】：阶段 1 前置检查：判断是否可以跳过规划，直接去写正文
+                vol = self.meta["volumes"][self.target_v_idx]
+                existing_chaps = vol.get("chapters", [])
+
+                # 检查是否有没有梗概的空白章
+                has_blank_chapters = False
+                for c in existing_chaps:
+                    if len(c.get("ai_synopsis", "").strip()) < 10 and len(c.get("synopsis", "").strip()) < 10:
+                        has_blank_chapters = True
+                        break
+
+                skip_planning = False
+                if len(existing_chaps) >= 20 and not has_blank_chapters:
+                    self.log_signal.emit(f"⏭️ {vol['name']} 章节数量充足(>=20)且无空白梗概，跳过细纲规划。")
+                    skip_planning = True
+                elif len(existing_chaps) > 0 and not has_blank_chapters:
+                    self.status_signal.emit("🔄 正在评估本卷剧情是否已闭环...")
+                    if self._is_volume_concluded(self.target_v_idx):
+                        self.log_signal.emit(f"⏭️ AI判断 {vol['name']} 已在现有章节中完结，跳过细纲规划。")
+                        skip_planning = True
+
+                # 如果不满足跳过条件，才去执行单卷章节的统筹规划
+                if not skip_planning:
+                    self.status_signal.emit(f"🔄 阶段 1/2: 正在为当前卷规划章节细纲...")
+                    self._plan_single_volume_chapters(self.target_v_idx)
+                    if self._is_cancelled: return
+
+            # 最终阶段：逐章生成正文 (内部本身就会自动跳过字数>100的已有内容章节)
+            step_str = "3/3" if self.mode == "full" else "2/2"
+            self.status_signal.emit(f"🔄 阶段 {step_str}: 开启全自动挂机码字模式！")
             self._generate_all_contents()
 
             if not self._is_cancelled:
-                self.status_signal.emit("✅ 全书挂机生成完毕！")
+                self.status_signal.emit("✅ 挂机生成完毕！")
             self.finished_signal.emit()
 
         except Exception as e:
             self.error_signal.emit(str(e))
+
+    # 【新增方法】轻量级 AI 判断本卷是否已在现有章节中完结
+    def _is_volume_concluded(self, target_v_idx):
+        vol = self.meta["volumes"][target_v_idx]
+        existing_chaps = vol.get("chapters", [])
+        if not existing_chaps:
+            return False
+
+        vol_synopsis = vol.get("synopsis", "")
+        chaps_info = ""
+        for i, c in enumerate(existing_chaps):
+            syn = c.get("ai_synopsis", "") if c.get("ai_synopsis", "").strip() else c.get("synopsis", "")
+            chaps_info += f"- {c['name']}: {syn}\n"
+
+        sys_prompt = "你是一个专业的小说主编。必须返回严格的JSON对象。"
+        user_prompt = f"""【本卷核心梗概】
+{vol_synopsis}
+
+【已有章节剧情概括】
+{chaps_info}
+
+任务指令：
+请仔细对比【本卷核心梗概】和【已有章节剧情概括】，评估目前的章节是否已经将本卷的核心主线和目标完整讲完，并达到了本卷的完结闭环状态？
+如果情节还差一点没讲完，请返回 false。只有确信已经讲完时才返回 true。
+返回格式（严格JSON）：
+{{
+    "is_concluded": true/false
+}}"""
+        try:
+            result = self._call_llm_for_json(sys_prompt, user_prompt)
+            return result.get("is_concluded", False)
+        except Exception:
+            return False
 
     def _call_llm_for_json(self, system_prompt, user_prompt):
         """请求 LLM 并强制返回 JSON 格式"""
@@ -129,6 +196,90 @@ class AutoPilotWorker(QThread):
             ]
         )
         return json.loads(response.choices[0].message.content)
+
+    # 【新增方法】专属单卷规划逻辑，重写 Prompt 分布
+    def _plan_single_volume_chapters(self, target_v_idx):
+        vol = self.meta["volumes"][target_v_idx]
+        existing_chaps = vol.get("chapters", [])
+        existing_chaps_info = [
+            {"name": c["name"], "user_synopsis": c.get("synopsis", ""), "ai_synopsis": c.get("ai_synopsis", "")} for
+            c in existing_chaps]
+
+        global_synopsis = self.meta.get("global_synopsis", "")
+        char_texts = [f"【{c['name']}】 性别:{c['gender']} 性格:{c['personality']} 经历:{c['experience']}" for c in
+                      self.meta.get("characters", [])]
+        char_setting = "\n".join(char_texts) if char_texts else "未提供明确人物。"
+
+        # 获取历史轨迹
+        history_str = ""
+        for i in range(target_v_idx):
+            temp_v = self.meta["volumes"][i]
+            history_str += f"▶ {temp_v['name']} (本卷梗概: {temp_v.get('synopsis', '无')})\n"
+            for temp_c in temp_v.get("chapters", []):
+                temp_ai_syn = temp_c.get("ai_synopsis", "")
+                temp_user_syn = temp_c.get("synopsis", "")
+                display_syn = temp_ai_syn if temp_ai_syn.strip() else (
+                    temp_user_syn if temp_user_syn.strip() else "暂无梗概")
+                history_str += f"  - {temp_c['name']}: {display_syn}\n"
+
+        if not history_str.strip():
+            history_str = "前面暂无卷宗历史。"
+
+        # 寻觅上一卷的最后一章作为过渡
+        prev_chapter_content = ""
+        if target_v_idx > 0 and len(self.meta["volumes"][target_v_idx - 1]["chapters"]) > 0:
+            pv_idx = target_v_idx - 1
+            pc_idx = len(self.meta["volumes"][pv_idx]["chapters"]) - 1
+            pv_name = self.meta["volumes"][pv_idx]["name"]
+            pc_name = self.meta["volumes"][pv_idx]["chapters"][pc_idx]["name"]
+            prev_chapter_content = self.project.read_chapter_content(pv_name, pc_name)
+            if len(prev_chapter_content) > 1500:
+                prev_chapter_content = "...(前文省略)...\n" + prev_chapter_content[-1500:]
+
+        # 构建 Prompt
+        sys_prompt = f"你是一个专业且注重伏笔与逻辑连贯的顶级网文写手。必须返回严格的JSON对象。\n\n【全局大纲】\n{global_synopsis}\n\n【核心人物设定】\n{char_setting}"
+
+        user_prompt = f"【过往剧情轨迹参考(历史记录)】\n{history_str}\n\n"
+        if prev_chapter_content.strip():
+            user_prompt += f"【紧接上一章的末尾内容】\n{prev_chapter_content.strip()}\n\n"
+
+        user_prompt += f"【当前目标任务】：{vol['name']}\n"
+        user_prompt += f"【本卷核心梗概】：{vol.get('synopsis', '无')}\n"
+        user_prompt += f"【本卷已有章节信息】：{json.dumps(existing_chaps_info, ensure_ascii=False)}\n\n"
+
+        user_prompt += """任务指令：
+1. 请根据【本卷核心梗概】严格将剧情“切碎”和展开。
+2. 遍历【本卷已有章节信息】。如果某章的 ai_synopsis 为空或较短，请严格依据用户的 user_synopsis 结合前文将其扩写为包含具体情节和细节的详细梗概。
+3. 如果本卷故事在已有章节中尚未完结，请在 new_chapters 中继续规划后续的全新章节名与详细梗概，尽情扩充章节数量（几十个不嫌多），直至本卷剧情完美闭环。
+
+返回格式（严格JSON）：
+{
+    "updated_existing_chapters": [
+        {"name": "已有章节名", "ai_synopsis": "扩写后的详细梗概"}
+    ],
+    "new_chapters": [
+        {"name": "新章节名", "ai_synopsis": "新规划的详细梗概"}
+    ]
+}"""
+        result = self._call_llm_for_json(sys_prompt, user_prompt)
+
+        for updated_chap in result.get("updated_existing_chapters", []):
+            if self._is_cancelled: break
+            for c_idx, c in enumerate(vol["chapters"]):
+                if c["name"] == updated_chap["name"]:
+                    if len(c.get("ai_synopsis", "")) < len(updated_chap["ai_synopsis"]):
+                        self.update_chapter_signal.emit(target_v_idx, c_idx, updated_chap["ai_synopsis"])
+                        c["ai_synopsis"] = updated_chap["ai_synopsis"]
+                        self.log_signal.emit(f"📝 补充空白章节细纲：{vol['name']} - {c['name']}")
+                    break
+
+        for chap in result.get("new_chapters", []):
+            if self._is_cancelled: break
+            existing_names = [c["name"] for c in vol["chapters"]]
+            if chap["name"] in existing_names:
+                continue
+            self.add_chapter_signal.emit(target_v_idx, chap["name"], chap["ai_synopsis"])
+            self.log_signal.emit(f"📄 自动规划补齐新章节：{vol['name']} - {chap['name']}")
 
     def _plan_volumes(self):
         existing_vols_info = []
@@ -147,8 +298,8 @@ class AutoPilotWorker(QThread):
         current_vol_count = len(self.meta["volumes"])
 
         # 【修改处】双重判定：数量达标 且 没有空卷，才跳过
-        if current_vol_count >= 5 and not has_blank_volumes:
-            self.log_signal.emit("⏭️ 当前卷数已达标（>=5卷）且无空白卷梗概，跳过卷宗规划。")
+        if current_vol_count >= 1 and not has_blank_volumes:
+            self.log_signal.emit("⏭️ 当前卷数已达标（>=1卷）且无空白卷梗概，跳过卷宗规划。")
             return
 
         global_synopsis = self.meta.get("global_synopsis", "")
@@ -165,6 +316,7 @@ class AutoPilotWorker(QThread):
 1. 遍历【目前已有的卷宗信息】。如果某卷的 synopsis 为空或非常简短，请严格依据【全局大纲】和上下文，为其扩写为详细的剧情走向梗概（绝不能改变原有的卷名！）。如果该卷的 synopsis 已经有具体内容，请原样保留，不要做任何删改。
 2. 判断故事是否完结。如果未完结，请在 new_volumes 中继续规划后续所需的新卷宗（卷名与详细梗概）。
 3. 扩写的内容不可过于俗套
+4. 卷数应在5-8卷为宜
 
 返回格式（严格JSON）：
 {{
@@ -224,8 +376,8 @@ class AutoPilotWorker(QThread):
                     "ai_synopsis": ai_syn
                 })
 
-            if current_chap_count >= 4 and not has_blank_chapters:
-                self.log_signal.emit(f"⏭️ {vol['name']} 章节数已达标(>=4)且无空白梗概，跳过细纲规划。")
+            if current_chap_count >= 20 and not has_blank_chapters:
+                self.log_signal.emit(f"⏭️ {vol['name']} 章节数已达标(>=20)且无空白梗概，跳过细纲规划。")
                 continue
 
             # 【新增逻辑】：在每一次规划当前卷的章节前，重新获取一遍整本书的最新全局上下文
@@ -242,7 +394,7 @@ class AutoPilotWorker(QThread):
                     all_context_str += f"  - {temp_c['name']}: {display_syn}\n"
                 all_context_str += "\n"
 
-            sys_prompt = "你是一个专业且注重伏笔与逻辑连贯的顶级网文写手和主编。必须返回严格的JSON对象。"
+            sys_prompt = "你是一个专业且注重伏笔与逻辑连贯的顶级网文写手。必须返回严格的JSON对象。"
             user_prompt = f"""
 {all_context_str}
 
@@ -253,7 +405,7 @@ class AutoPilotWorker(QThread):
 任务指令：
 1. 请充分阅读上方的【全书全局卷章概览】，在补齐章节名和扩写梗概时，必须结合所有卷宗梗概和已有章节的剧情走向，确保前后呼应、不吃书、情节不割裂。
 2. 遍历【本卷已有章节信息】。如果某章的 ai_synopsis 为空或较短，请严格依据用户的 user_synopsis（绝不能吞掉或改变用户原意！）并结合前后文将其扩写为包含具体情节和细节的详细梗概。
-3. 判断本卷故事是否完结。如果未完结，请在 new_chapters 中结合全局背景继续规划后续的全新章节名与详细梗概，直至本卷剧情完美闭环。
+3. 如果本卷故事在已有章节中尚未完结，请在 new_chapters 中继续规划后续的全新章节名与详细梗概，尽情扩充章节数量（几十个不嫌多），直至本卷剧情完美闭环。
 
 返回格式（严格JSON）：
 {{
@@ -295,6 +447,9 @@ class AutoPilotWorker(QThread):
         # 遍历所有卷和章，寻找没有内容（或者还没写）的章节开始写
         for v_idx, vol in enumerate(self.meta["volumes"]):
             for c_idx, chap in enumerate(vol["chapters"]):
+                if self.mode == "volume" and v_idx != self.target_v_idx:
+                    continue  # 如果是“一键成卷”模式，跳过其他卷
+
                 if self._is_cancelled: return
 
                 # 这里假设如果章节还没有内容，我们就自动写它
@@ -350,7 +505,11 @@ class AutoPilotWorker(QThread):
                 sys_prompt = f"""你是一位经验丰富的网文大神作家。
                     【全局大纲】：{self.meta.get('global_synopsis', '')}
                     【核心人物设定】：\n{char_setting}
-                    【要求】：直接输出正文，禁止任何多余的寒暄。在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
+                    【要求】：
+                    直接输出正文，
+                    禁止任何多余的寒暄。
+                    对话要口语化，多用短句，讲话方式符合人设，拒绝‘翻译腔’。角色说话要有情绪和潜台词，不要像写说明书或做思想汇报一样客观中立。特别注意：不要出现‘我无权评价’、‘这取决于你’这类典型的 AI 废话，或者用正常人类不会使用的比喻句等。
+                    在正文输出完毕后，必须另起一行并严格以 `[AI_SUMMARY]` 作为分割符，然后输出约500字高度结构化的【本章复盘与记忆锚点】。
 在 `[AI_SUMMARY]` 之后，必须严格按照以下3个维度输出（客观、精炼，纯作内部记忆使用）：
                     1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件（起因、经过、结果）。
                     2. 人物状态更新：记录本章主角及配角的行为及心态。
@@ -697,3 +856,135 @@ class CorrectionWorker(QThread):
 
                 history_str += f"  - 第{c_idx + 1}章 [{chap['name']}]: {display_syn}\n"
         return history_str
+
+class SummaryWorker(QThread):
+    status_signal = pyqtSignal(str)
+    summary_ready_signal = pyqtSignal(int, int, str)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, api_key, base_url, model, temperature, tasks):
+        """
+        tasks 格式: [{"v_idx": int, "c_idx": int, "vol_name": str, "chap_name": str, "content": str}, ...]
+        """
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.tasks = tasks
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, 'client'):
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            for i, task in enumerate(self.tasks):
+                if self._is_cancelled:
+                    break
+
+                self.status_signal.emit(
+                    f"⏳ 正在为前文补全 AI 总结 ({i + 1}/{len(self.tasks)}): {task['vol_name']} - {task['chap_name']}")
+
+                sys_prompt = "你是一个专业的小说阅读助手和主编。必须返回严格的JSON对象。"
+                user_prompt = f"""
+请仔细阅读以下小说章节内容，并严格按照以下3个维度输出约500字的本章详细梗概（客观、精炼，作为后续AI写作的记忆锚点）：
+1. 核心剧情脉络：按时间顺序简述本章发生的实质性事件。
+2. 人物状态更新：记录本章主角及配角的行为及心态。
+3. 物品设定更新：记录本章所有物品状态。
+
+章节正文：
+{task['content']}
+
+返回格式（严格JSON）：
+{{
+    "summary": "生成的500字详细结构化梗概"
+}}
+"""
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.temperature,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+                )
+
+                # 解析返回的JSON，兼容可能带有 Markdown 代码块的情况
+                content = response.choices[0].message.content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.endswith("```"):
+                    content = content[:-3]
+
+                result = json.loads(content)
+                summary = result.get("summary", "")
+
+                if summary:
+                    self.summary_ready_signal.emit(task['v_idx'], task['c_idx'], summary)
+
+            self.finished_signal.emit()
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+class SegmentModifyWorker(QThread):
+    reasoning_signal = pyqtSignal(str)
+    content_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, api_key, base_url, model, temperature, sys_prompt, user_prompt):
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.sys_prompt = sys_prompt
+        self.user_prompt = user_prompt
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, 'client'):
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=self.temperature,
+                messages=[
+                    {"role": "system", "content": self.sys_prompt},
+                    {"role": "user", "content": self.user_prompt}
+                ],
+                stream=True
+            )
+
+            for chunk in response:
+                if self._is_cancelled:
+                    break
+                delta = chunk.choices[0].delta
+
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    self.reasoning_signal.emit(reasoning)
+
+                content = getattr(delta, "content", None)
+                if content:
+                    self.content_signal.emit(content)
+
+            self.finished_signal.emit()
+        except Exception as e:
+            self.error_signal.emit(str(e))
